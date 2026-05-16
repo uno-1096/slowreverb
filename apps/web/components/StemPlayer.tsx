@@ -19,6 +19,8 @@ interface Effects {
   volume: number;
 }
 
+const SKIP_SEC = 10;
+
 export default function StemPlayer({ stem, url, color, label, emoji }: Props) {
   const [effects, setEffects] = useState<Effects>({
     speed: 0.75,
@@ -28,32 +30,45 @@ export default function StemPlayer({ stem, url, color, label, emoji }: Props) {
   });
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
+  const [isDownloading, setIsDownloading] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [isSeeking, setIsSeeking] = useState(false);
+  const [seekValue, setSeekValue] = useState(0);
 
   const ctxRef = useRef<AudioContext | null>(null);
   const bufferRef = useRef<AudioBuffer | null>(null);
   const sourceRef = useRef<AudioBufferSourceNode | null>(null);
   const gainRef = useRef<GainNode | null>(null);
-  const startTimeRef = useRef(0);
-  const startOffsetRef = useRef(0);
+  const pausedAtRef = useRef(0);
+  const startCtxTimeRef = useRef(0);
   const rafRef = useRef(0);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const effectsRef = useRef(effects);
+  effectsRef.current = effects;
 
   useEffect(() => {
     let cancelled = false;
     const ctx = new AudioContext();
     ctxRef.current = ctx;
 
-    fetch(url).then(r => r.arrayBuffer()).then(ab => ctx.decodeAudioData(ab)).then(buf => {
-      if (cancelled) return;
-      bufferRef.current = buf;
-      setDuration(buf.duration);
-      setIsLoading(false);
-      setTimeout(() => drawWave(buf), 50);
-    }).catch(() => { if (!cancelled) setIsLoading(false); });
+    fetch(url)
+      .then(r => r.arrayBuffer())
+      .then(ab => ctx.decodeAudioData(ab))
+      .then(buf => {
+        if (cancelled) return;
+        bufferRef.current = buf;
+        setDuration(buf.duration);
+        setIsLoading(false);
+        setTimeout(() => drawWave(buf), 50);
+      })
+      .catch(() => { if (!cancelled) setIsLoading(false); });
 
-    return () => { cancelled = true; cancelAnimationFrame(rafRef.current); ctx.close(); };
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(rafRef.current);
+      ctx.close();
+    };
   }, [url]);
 
   const drawWave = (buf: AudioBuffer) => {
@@ -78,65 +93,125 @@ export default function StemPlayer({ stem, url, color, label, emoji }: Props) {
     }
   };
 
-  const stopPlayback = useCallback(() => {
+  const getLivePosition = useCallback(() => {
+    const ctx = ctxRef.current;
+    if (!ctx || !isPlaying) return pausedAtRef.current;
+    const elapsed = (ctx.currentTime - startCtxTimeRef.current) * effectsRef.current.speed;
+    return Math.min(pausedAtRef.current + elapsed, bufferRef.current?.duration ?? 0);
+  }, [isPlaying]);
+
+  const stopSource = useCallback(() => {
     cancelAnimationFrame(rafRef.current);
     if (sourceRef.current) {
-      try { sourceRef.current.stop(); } catch {}
+      try { sourceRef.current.onended = null; sourceRef.current.stop(); } catch {}
       sourceRef.current.disconnect();
       sourceRef.current = null;
     }
-    setIsPlaying(false);
   }, []);
 
-  const startPlayback = useCallback((offset = 0) => {
+  const startPlayback = useCallback((offset: number) => {
     const ctx = ctxRef.current;
     const buf = bufferRef.current;
     if (!ctx || !buf) return;
     if (ctx.state === "suspended") ctx.resume();
-    stopPlayback();
+
+    stopSource();
+
+    const clamped = Math.max(0, Math.min(offset, buf.duration));
+    pausedAtRef.current = clamped;
+    startCtxTimeRef.current = ctx.currentTime;
 
     const source = ctx.createBufferSource();
     source.buffer = buf;
-    source.playbackRate.value = effects.speed;
+    source.playbackRate.value = effectsRef.current.speed;
 
     const gain = ctx.createGain();
-    gain.gain.value = effects.muted ? 0 : effects.volume;
+    gain.gain.value = effectsRef.current.muted ? 0 : effectsRef.current.volume;
     gainRef.current = gain;
 
     source.connect(gain);
     gain.connect(ctx.destination);
     sourceRef.current = source;
-    startTimeRef.current = ctx.currentTime;
-    startOffsetRef.current = offset;
 
-    source.start(0, offset);
-    source.onended = () => { setIsPlaying(false); setCurrentTime(0); startOffsetRef.current = 0; };
+    source.start(0, clamped);
+    source.onended = () => {
+      if (sourceRef.current === source) {
+        pausedAtRef.current = 0;
+        setCurrentTime(0);
+        setIsPlaying(false);
+      }
+    };
     setIsPlaying(true);
 
     const tick = () => {
       const ctx2 = ctxRef.current;
       if (!ctx2) return;
-      const elapsed = (ctx2.currentTime - startTimeRef.current) * effects.speed;
-      setCurrentTime(Math.min(startOffsetRef.current + elapsed, buf.duration));
+      setCurrentTime(getLivePosition());
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
-  }, [effects, stopPlayback]);
+  }, [stopSource, getLivePosition]);
+
+  const pause = useCallback(() => {
+    pausedAtRef.current = getLivePosition();
+    stopSource();
+    setIsPlaying(false);
+  }, [getLivePosition, stopSource]);
 
   const togglePlay = () => {
     if (isPlaying) {
-      const ctx = ctxRef.current;
-      if (ctx) {
-        const elapsed = (ctx.currentTime - startTimeRef.current) * effects.speed;
-        startOffsetRef.current = Math.min(startOffsetRef.current + elapsed, duration);
-      }
-      stopPlayback();
+      pause();
     } else {
-      startPlayback(startOffsetRef.current);
+      startPlayback(pausedAtRef.current);
     }
   };
 
-  const fmt = (s: number) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
+  const seek = useCallback((t: number) => {
+    pausedAtRef.current = t;
+    setCurrentTime(t);
+    if (isPlaying) startPlayback(t);
+  }, [isPlaying, startPlayback]);
+
+  const skip = (delta: number) => {
+    const next = Math.max(0, Math.min(getLivePosition() + delta, duration));
+    seek(next);
+  };
+
+  const onSeekStart = () => {
+    setIsSeeking(true);
+    setSeekValue(getLivePosition());
+    if (isPlaying) pause();
+  };
+  const onSeekChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const t = parseFloat(e.target.value);
+    setSeekValue(t);
+    setCurrentTime(t);
+  };
+  const onSeekEnd = (e: React.SyntheticEvent<HTMLInputElement>) => {
+    const t = parseFloat((e.target as HTMLInputElement).value);
+    setIsSeeking(false);
+    seek(t);
+  };
+
+  const handleDownload = async () => {
+    setIsDownloading(true);
+    try {
+      const res = await fetch(url);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `${stem}.mp3`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (err) {
+      console.error("Download failed:", err);
+    } finally {
+      setIsDownloading(false);
+    }
+  };
+
+  const fmt = (s: number) =>
+    `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, "0")}`;
 
   const updateEffect = <K extends keyof Effects>(key: K, val: Effects[K]) => {
     setEffects(prev => {
@@ -146,10 +221,17 @@ export default function StemPlayer({ stem, url, color, label, emoji }: Props) {
       }
       if (sourceRef.current && key === "speed") {
         sourceRef.current.playbackRate.value = val as number;
+        const ctx = ctxRef.current;
+        if (ctx) {
+          pausedAtRef.current = getLivePosition();
+          startCtxTimeRef.current = ctx.currentTime;
+        }
       }
       return next;
     });
   };
+
+  const displayTime = isSeeking ? seekValue : currentTime;
 
   return (
     <div className={`rounded-xl p-4 space-y-3 border ${effects.muted ? "opacity-50 border-zinc-800" : "border-zinc-700"} bg-zinc-900`}>
@@ -163,41 +245,65 @@ export default function StemPlayer({ stem, url, color, label, emoji }: Props) {
               ? "bg-zinc-800 border-zinc-700 text-zinc-500"
               : "bg-zinc-700 border-zinc-600 text-zinc-200"
           }`}
-          aria-label={effects.muted ? "Unmute" : "Mute"}
         >
           {effects.muted ? "muted" : "mute"}
         </button>
         <button
-          onClick={togglePlay}
-          disabled={isLoading}
-          className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm transition-colors"
-          style={{ backgroundColor: color }}
-          aria-label={isPlaying ? "Pause" : "Play"}
+          onClick={handleDownload}
+          disabled={isLoading || isDownloading}
+          className="text-xs px-2 py-1 rounded-lg border border-zinc-600 bg-zinc-800 text-zinc-300 hover:bg-zinc-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         >
-          {isLoading ? "…" : isPlaying ? "⏸" : "▶"}
+          {isDownloading ? "…" : "↓"}
         </button>
       </div>
 
-      <canvas ref={canvasRef} width={600} height={40}
+      <canvas
+        ref={canvasRef}
+        width={600}
+        height={40}
         className="w-full h-10 block rounded cursor-pointer"
         onClick={e => {
           const rect = e.currentTarget.getBoundingClientRect();
-          const t = ((e.clientX - rect.left) / rect.width) * duration;
-          startOffsetRef.current = t;
-          setCurrentTime(t);
-          if (isPlaying) startPlayback(t);
+          seek(((e.clientX - rect.left) / rect.width) * duration);
         }}
       />
 
       <div className="flex items-center gap-2">
-        <span className="text-zinc-500 text-xs w-8 tabular-nums">{fmt(currentTime)}</span>
-        <input type="range" min={0} max={duration} step={0.1} value={currentTime}
-          onChange={e => {
-            const t = parseFloat(e.target.value);
-            startOffsetRef.current = t; setCurrentTime(t);
-            if (isPlaying) startPlayback(t);
-          }}
-          className="flex-1" style={{ accentColor: color }} aria-label="Seek" />
+        <span className="text-zinc-500 text-xs w-8 tabular-nums">{fmt(displayTime)}</span>
+        <button
+          onClick={() => skip(-SKIP_SEC)}
+          disabled={isLoading}
+          className="text-zinc-400 hover:text-zinc-200 transition-colors text-sm disabled:opacity-30"
+          title="-10s"
+        >⏮</button>
+        <button
+          onClick={togglePlay}
+          disabled={isLoading}
+          className="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm disabled:opacity-30 flex-shrink-0"
+          style={{ backgroundColor: color }}
+        >
+          {isLoading ? "…" : isPlaying ? "⏸" : "▶"}
+        </button>
+        <button
+          onClick={() => skip(SKIP_SEC)}
+          disabled={isLoading}
+          className="text-zinc-400 hover:text-zinc-200 transition-colors text-sm disabled:opacity-30"
+          title="+10s"
+        >⏭</button>
+        <input
+          type="range"
+          min={0}
+          max={duration}
+          step={0.1}
+          value={displayTime}
+          onMouseDown={onSeekStart}
+          onTouchStart={onSeekStart}
+          onChange={onSeekChange}
+          onMouseUp={onSeekEnd}
+          onTouchEnd={onSeekEnd}
+          className="flex-1"
+          style={{ accentColor: color }}
+        />
         <span className="text-zinc-500 text-xs w-8 tabular-nums text-right">{fmt(duration)}</span>
       </div>
 
